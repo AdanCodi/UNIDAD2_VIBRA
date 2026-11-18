@@ -1,0 +1,18 @@
+VIBRA WEAR OS 1.3 — PROYECTO ESCOLAR
+
+1) En Android Studio elige File > Open y abre la carpeta Vibra_WearOS.
+2) Gradle JDK: 17 o 21. Gradle Plugin 8.13.2. Android SDK 36.
+3) Instala :app en el celular y :wear en un reloj Wear OS.
+4) Ambas apps deben compartir applicationId "com.vibra.app" y firma debug.
+5) Vincula reloj y teléfono con Wear OS / Pairing Assistant.
+6) Abre Vibra en el celular y configura tus 3 credenciales de ACRCloud.
+7) Acepta permisos micrófono y notificaciones.
+8) En el reloj toca el icono; en el celular toca la notificación.
+9) El teléfono escucha 11 segundos, ACRCloud identifica, y el resultado aparece en el reloj.
+
+IMPORTANTE: Un emulador Wear OS necesita Google Play Services y emparejamiento.
+IMPORTANTE: No existe ningún APK compilado dentro del ZIP si aún no ejecutaste la compilación.
+Puedes obtener ambos con Generar_APKs_Windows.bat o Build > Build APK(s).
+
+ARCHIVOS: app/ = celular; wear/ = reloj; CODIGO_FUENTE/ = copia en texto plano;
+CASO_DE_ESTUDIO_WEAR.md = justificación académica.

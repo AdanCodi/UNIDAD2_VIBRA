@@ -1,0 +1,2189 @@
+VIBRA WEAR — CÓDIGO FUENTE EN TEXTO PLANO
+Proyecto Android Studio para celular y reloj Wear OS
+
+
+========================================================================================
+app/build.gradle.kts
+========================================================================================
+
+plugins {
+    id("com.android.application")
+    id("org.jetbrains.kotlin.android")
+    id("org.jetbrains.kotlin.plugin.compose")
+}
+
+android {
+    namespace = "com.vibra.app"
+    compileSdk = 36
+
+    defaultConfig {
+        applicationId = "com.vibra.app"
+        minSdk = 26
+        targetSdk = 35
+        versionCode = 6
+        versionName = "1.3.0"
+    }
+
+    buildTypes {
+        release {
+            isMinifyEnabled = false
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+    buildFeatures {
+        compose = true
+    }
+    packaging {
+        resources {
+            excludes += "/META-INF/{AL2.0,LGPL2.1}"
+        }
+    }
+}
+
+// Kotlin 2.3+: the obsolete android.kotlinOptions DSL is not supported.
+kotlin {
+    compilerOptions {
+        jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17)
+    }
+}
+
+dependencies {
+    val composeBom = platform("androidx.compose:compose-bom:2026.06.01")
+    implementation(composeBom)
+    implementation("androidx.activity:activity-compose:1.13.0")
+    implementation("androidx.activity:activity-ktx:1.13.0")
+    implementation("androidx.compose.ui:ui")
+    implementation("androidx.compose.ui:ui-tooling-preview")
+    implementation("androidx.compose.foundation:foundation")
+    implementation("androidx.compose.material3:material3")
+    implementation("androidx.compose.material:material-icons-extended")
+    implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.10.0")
+    implementation("androidx.lifecycle:lifecycle-runtime-compose:2.10.0")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2")
+    implementation("io.coil-kt:coil-compose:2.7.0")
+    implementation("com.google.android.gms:play-services-wearable:20.0.1")
+    debugImplementation("androidx.compose.ui:ui-tooling")
+}
+
+
+========================================================================================
+app/src/main/AndroidManifest.xml
+========================================================================================
+
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-feature android:name="android.hardware.microphone" android:required="false" />
+
+    <application
+        android:allowBackup="false"
+        android:usesCleartextTraffic="false"
+        android:label="@string/app_name"
+        android:icon="@mipmap/ic_launcher"
+        android:theme="@style/Theme.Vibra"
+        android:supportsRtl="true">
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:screenOrientation="unspecified">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+        <service android:name=".wearlink.PhoneWatchListenerService"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="com.google.android.gms.wearable.MESSAGE_RECEIVED" />
+                <data android:scheme="wear" android:host="*" android:pathPrefix="/vibra/request" />
+            </intent-filter>
+        </service>
+    </application>
+</manifest>
+
+
+========================================================================================
+app/src/main/java/com/vibra/app/MainActivity.kt
+========================================================================================
+
+package com.vibra.app
+
+import android.Manifest
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.net.Uri
+import android.os.Build
+import android.os.Bundle
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.activity.viewModels
+import androidx.compose.runtime.getValue
+import androidx.compose.ui.platform.LocalContext
+import androidx.core.content.ContextCompat
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.lifecycleScope
+import com.vibra.app.ui.VibraApp
+import com.vibra.app.wearlink.WatchLink
+import kotlinx.coroutines.launch
+
+class MainActivity : ComponentActivity() {
+    private val viewModel: VibraViewModel by viewModels()
+    private var activeWatchRequest: String? = null
+    private var reportedPhase: ScanPhase? = null
+
+    private val watchMicrophonePermission = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        if (granted) beginWearRecognition()
+        else {
+            activeWatchRequest?.let {
+                WatchLink.publish(this, it, "error", detail = "Permiso de micrófono rechazado")
+            }
+            activeWatchRequest = null
+            viewModel.showError("El reloj necesita permiso para usar el micrófono del celular.")
+        }
+    }
+    private val notificationPermission = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { /* Si se deniega, el usuario puede abrir Vibra manualmente. */ }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContent {
+            val state by viewModel.state.collectAsStateWithLifecycle()
+            val context = LocalContext.current
+            val permission = rememberLauncherForActivityResult(
+                ActivityResultContracts.RequestPermission()
+            ) { granted ->
+                if (granted) viewModel.startListening()
+                else viewModel.showError("Debes permitir el micrófono para reconocer música.")
+            }
+            VibraApp(
+                state = state,
+                onListen = {
+                    if (state.phase == ScanPhase.RECORDING) {
+                        viewModel.cancelListening()
+                    } else if (ContextCompat.checkSelfPermission(
+                            context, Manifest.permission.RECORD_AUDIO
+                        ) == PackageManager.PERMISSION_GRANTED
+                    ) {
+                        viewModel.startListening()
+                    } else {
+                        permission.launch(Manifest.permission.RECORD_AUDIO)
+                    }
+                },
+                onSaveCredentials = viewModel::saveCredentials,
+                onClearHistory = viewModel::clearHistory,
+                onOpenLink = { link ->
+                    val parsed = Uri.parse(link)
+                    if (parsed.scheme == "https" || parsed.scheme == "http") {
+                        runCatching { startActivity(Intent(Intent.ACTION_VIEW, parsed)) }
+                    }
+                },
+                onShareSong = { song ->
+                    val link = song.spotifyUrl ?: song.songLink
+                    val details = "${song.title} — ${song.artist}" +
+                        (if (link.isNullOrBlank()) "" else "\n$link")
+                    startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).apply {
+                        type = "text/plain"
+                        putExtra(Intent.EXTRA_TEXT, details)
+                    }, "Compartir canción"))
+                }
+            )
+        }
+        lifecycleScope.launch {
+            viewModel.state.collect { state -> reportToWear(state) }
+        }
+        if (Build.VERSION.SDK_INT >= 33 && ContextCompat.checkSelfPermission(
+                this, Manifest.permission.POST_NOTIFICATIONS
+            ) != PackageManager.PERMISSION_GRANTED
+        ) notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+    }
+
+    override fun onResume() {
+        super.onResume()
+        handleIncomingWearRequest()
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleIncomingWearRequest()
+    }
+
+    private fun handleIncomingWearRequest() {
+        val id = intent?.getStringExtra(WatchLink.EXTRA_REQUEST_ID)
+            ?.takeIf { it.isNotBlank() }
+            ?: WatchLink.takePending(this)
+            ?: return
+        intent?.removeExtra(WatchLink.EXTRA_REQUEST_ID)
+        WatchLink.takePending(this) // Evita reactivar la misma solicitud.
+        if (id == activeWatchRequest) return
+        activeWatchRequest = id
+        reportedPhase = null
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) ==
+            PackageManager.PERMISSION_GRANTED
+        ) beginWearRecognition()
+        else watchMicrophonePermission.launch(Manifest.permission.RECORD_AUDIO)
+    }
+
+    private fun beginWearRecognition() {
+        val id = activeWatchRequest ?: return
+        WatchLink.publish(this, id, "recording", detail = "Escuchando desde el celular")
+        viewModel.startListening()
+    }
+
+    private fun reportToWear(state: VibraState) {
+        val id = activeWatchRequest ?: return
+        if (reportedPhase == state.phase) return
+        when (state.phase) {
+            ScanPhase.RECORDING -> WatchLink.publish(this, id, "recording", detail = "Grabando 11 segundos")
+            ScanPhase.IDENTIFYING -> WatchLink.publish(this, id, "identifying", detail = "Buscando canción")
+            ScanPhase.FOUND -> {
+                val song = state.song
+                WatchLink.publish(this, id, "found", song?.title.orEmpty(), song?.artist.orEmpty())
+                activeWatchRequest = null
+            }
+            ScanPhase.NO_MATCH -> {
+                WatchLink.publish(this, id, "no_match", detail = "Sin coincidencias")
+                activeWatchRequest = null
+            }
+            ScanPhase.ERROR -> {
+                WatchLink.publish(this, id, "error", detail = state.errorMessage.orEmpty())
+                activeWatchRequest = null
+            }
+            ScanPhase.IDLE -> Unit
+        }
+        reportedPhase = state.phase
+    }
+
+    override fun onStop() {
+        if (activeWatchRequest != null && viewModel.state.value.phase == ScanPhase.RECORDING) {
+            WatchLink.publish(this, activeWatchRequest!!, "error", detail = "Grabación interrumpida")
+            activeWatchRequest = null
+        }
+        viewModel.cancelListening() // No mantener el micrófono abierto en segundo plano.
+        super.onStop()
+    }
+}
+
+
+========================================================================================
+app/src/main/java/com/vibra/app/VibraViewModel.kt
+========================================================================================
+
+package com.vibra.app
+
+import android.app.Application
+import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.viewModelScope
+import com.vibra.app.audio.MicrophoneRecorder
+import com.vibra.app.data.AcrCloudClient
+import com.vibra.app.data.AcrCredentials
+import com.vibra.app.data.Song
+import com.vibra.app.data.VibraPreferences
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+
+private const val RECORD_SECONDS = 11
+
+enum class ScanPhase { IDLE, RECORDING, IDENTIFYING, FOUND, NO_MATCH, ERROR }
+
+data class VibraState(
+    val phase: ScanPhase = ScanPhase.IDLE,
+    val secondsRemaining: Int = RECORD_SECONDS,
+    val inputLevel: Float = 0f,
+    val song: Song? = null,
+    val errorMessage: String? = null,
+    val history: List<Song> = emptyList(),
+    val acrCredentials: AcrCredentials = AcrCredentials()
+)
+
+class VibraViewModel(application: Application) : AndroidViewModel(application) {
+    private val preferences = VibraPreferences(application)
+    private val recorder = MicrophoneRecorder(application)
+    private val client = AcrCloudClient()
+    private val mutableState = MutableStateFlow(
+        VibraState(history = preferences.getHistory(), acrCredentials = preferences.acrCredentials)
+    )
+    val state = mutableState.asStateFlow()
+    private var recordJob: Job? = null
+
+    fun startListening() {
+        if (mutableState.value.phase == ScanPhase.RECORDING ||
+            mutableState.value.phase == ScanPhase.IDENTIFYING) return
+        val credentials = preferences.acrCredentials
+        if (!credentials.isConfigured()) {
+            showError("Primero agrega tu Host, Access Key y Access Secret de ACRCloud en Ajustes.")
+            return
+        }
+        recordJob = viewModelScope.launch {
+            var clip: java.io.File? = null
+            try {
+                recorder.start()
+                mutableState.value = mutableState.value.copy(
+                    phase = ScanPhase.RECORDING,
+                    secondsRemaining = RECORD_SECONDS,
+                    inputLevel = 0f,
+                    song = null,
+                    errorMessage = null
+                )
+                // Actualizamos el medidor 5 veces por segundo para comprobar si el
+                // hardware realmente está entregando sonido durante la grabación.
+                repeat(RECORD_SECONDS * 5) { tick ->
+                    delay(200L)
+                    mutableState.value = mutableState.value.copy(
+                        secondsRemaining = (RECORD_SECONDS - (tick + 1) / 5).coerceAtLeast(0),
+                        inputLevel = recorder.inputLevel
+                    )
+                }
+                val recordedFile = recorder.stop()
+                clip = recordedFile
+                mutableState.value = mutableState.value.copy(phase = ScanPhase.IDENTIFYING)
+                val song = withContext(Dispatchers.IO) { client.identify(recordedFile, credentials) }
+                if (song == null) {
+                    mutableState.value = mutableState.value.copy(phase = ScanPhase.NO_MATCH)
+                } else {
+                    preferences.saveSong(song)
+                    mutableState.value = mutableState.value.copy(
+                        phase = ScanPhase.FOUND, song = song, history = preferences.getHistory()
+                    )
+                }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: SecurityException) {
+                showError("Sin permiso para usar el micrófono.")
+            } catch (error: Exception) {
+                showError(error.message ?: "No fue posible reconocer la canción.")
+            } finally {
+                recorder.discard()
+                clip?.delete()
+            }
+        }
+    }
+
+    fun cancelListening() {
+        if (mutableState.value.phase == ScanPhase.RECORDING) {
+            recordJob?.cancel()
+            recorder.discard()
+            mutableState.value = mutableState.value.copy(phase = ScanPhase.IDLE)
+        }
+    }
+
+    fun showError(message: String) {
+        mutableState.value = mutableState.value.copy(phase = ScanPhase.ERROR, errorMessage = message)
+    }
+
+    fun saveCredentials(credentials: AcrCredentials) {
+        preferences.acrCredentials = credentials
+        mutableState.value = mutableState.value.copy(acrCredentials = preferences.acrCredentials)
+    }
+
+    fun clearHistory() {
+        preferences.clearHistory()
+        mutableState.value = mutableState.value.copy(history = emptyList())
+    }
+
+    override fun onCleared() {
+        recordJob?.cancel()
+        recorder.discard()
+        super.onCleared()
+    }
+}
+
+
+========================================================================================
+app/src/main/java/com/vibra/app/audio/MicrophoneRecorder.kt
+========================================================================================
+
+package com.vibra.app.audio
+
+import android.annotation.SuppressLint
+import android.content.Context
+import android.media.AudioFormat
+import android.media.AudioRecord
+import android.media.MediaRecorder
+import android.os.Build
+import java.io.File
+import java.io.FileOutputStream
+import java.io.IOException
+import java.io.RandomAccessFile
+import kotlin.math.sqrt
+import kotlin.math.log10
+
+/**
+ * Graba el micrófono en WAV PCM mono, sin códec AAC.
+ * Un hilo propio vacía el búfer de AudioRecord mientras la UI sigue respondiendo.
+ * El ViewModel conserva el control de la duración de la captura (11 segundos).
+ */
+class MicrophoneRecorder(private val context: Context) {
+    private companion object {
+        const val SAMPLE_RATE = 44_100
+        const val WAV_HEADER_BYTES = 44L
+        const val MIN_SECONDS = 6
+        // Solo bloqueamos capturas prácticamente digitales en cero. Un umbral fijo alto
+        // puede rechazar música real cuando el hardware usa una ganancia de micrófono baja.
+        const val DIGITAL_SILENCE_RMS = 2.0
+    }
+
+    @Volatile private var isCapturing = false
+    @Volatile private var workerError: Throwable? = null
+    private var recorder: AudioRecord? = null
+    private var worker: Thread? = null
+    private var outputFile: File? = null
+    private var capturedBytes = 0L
+    private var sumOfSquares = 0.0
+    private var sampleCount = 0L
+    private var maxSample = 0
+
+    // Medidor de entrada en vivo (0-1), publicado sin acceder al archivo de audio.
+    @Volatile var inputLevel: Float = 0f
+        private set
+
+    @SuppressLint("MissingPermission") // El permiso se solicita antes desde MainActivity.
+    @Synchronized
+    fun start() {
+        check(recorder == null) { "Ya hay una grabación activa" }
+        val minBuffer = AudioRecord.getMinBufferSize(
+            SAMPLE_RATE,
+            AudioFormat.CHANNEL_IN_MONO,
+            AudioFormat.ENCODING_PCM_16BIT
+        )
+        check(minBuffer > 0) { "El dispositivo no admite el formato de micrófono requerido" }
+
+        val input = AudioRecord(
+            MediaRecorder.AudioSource.MIC,
+            SAMPLE_RATE,
+            AudioFormat.CHANNEL_IN_MONO,
+            AudioFormat.ENCODING_PCM_16BIT,
+            maxOf(minBuffer * 2, 16_384)
+        )
+        if (input.state != AudioRecord.STATE_INITIALIZED) {
+            input.release()
+            throw IllegalStateException("No se pudo inicializar el micrófono")
+        }
+        val file = File.createTempFile("vibra_", ".wav", context.cacheDir)
+        try {
+            input.startRecording()
+            check(input.recordingState == AudioRecord.RECORDSTATE_RECORDING) {
+                "Android no permitió comenzar a grabar"
+            }
+            capturedBytes = 0L
+            sampleCount = 0L
+            sumOfSquares = 0.0
+            maxSample = 0
+            inputLevel = 0f
+            workerError = null
+            outputFile = file
+            recorder = input
+            isCapturing = true
+
+            val thread = Thread({
+                try {
+                    FileOutputStream(file).buffered().use { out ->
+                        out.write(ByteArray(WAV_HEADER_BYTES.toInt()))
+                        val buffer = ByteArray(8_192)
+                        while (isCapturing) {
+                            val bytes = input.read(buffer, 0, buffer.size)
+                            when {
+                                bytes > 0 -> {
+                                    val evenBytes = bytes - bytes % 2
+                                    out.write(buffer, 0, evenBytes)
+                                    capturedBytes += evenBytes
+                                    var offset = 0
+                                    var blockSumSquares = 0.0
+                                    var blockCount = 0
+                                    while (offset < evenBytes) {
+                                        val sample = (
+                                            ((buffer[offset + 1].toInt() shl 8) or
+                                                (buffer[offset].toInt() and 0xff))
+                                            ).toShort().toInt()
+                                        val square = sample.toDouble() * sample
+                                        sumOfSquares += square
+                                        blockSumSquares += square
+                                        sampleCount++
+                                        blockCount++
+                                        val amplitude = kotlin.math.abs(sample)
+                                        if (amplitude > maxSample) maxSample = amplitude
+                                        offset += 2
+                                    }
+                                    if (blockCount > 0) {
+                                        val blockRms = sqrt(blockSumSquares / blockCount)
+                                        val dBfs = 20.0 * log10((blockRms / 32768.0).coerceAtLeast(1e-9))
+                                        inputLevel = ((dBfs + 65.0) / 65.0).coerceIn(0.0, 1.0).toFloat()
+                                    }
+                                }
+                                !isCapturing -> break
+                                bytes == 0 -> Thread.yield()
+                                else -> throw IOException("El micrófono devolvió el código $bytes")
+                            }
+                        }
+                    }
+                } catch (error: Throwable) {
+                    workerError = error
+                } finally {
+                    isCapturing = false
+                }
+            }, "VibraAudioCapture")
+            worker = thread
+            thread.start()
+        } catch (error: Exception) {
+            isCapturing = false
+            recorder = null
+            outputFile = null
+            runCatching { input.stop() }
+            input.release()
+            file.delete()
+            throw error
+        }
+    }
+
+    @Synchronized
+    fun stop(): File {
+        val file = outputFile ?: throw IllegalStateException("No hay grabación activa")
+        // Android 10+ puede entregar ceros cuando otra captura tiene prioridad.
+        val clientSilenced = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            runCatching { recorder?.activeRecordingConfiguration?.isClientSilenced == true }
+                .getOrDefault(false)
+        } else false
+        stopHardware()
+        workerError?.let {
+            file.delete()
+            throw IOException("Falló la captura del micrófono: ${it.message}", it)
+        }
+        val bytes = capturedBytes
+        val duration = bytes / (SAMPLE_RATE * 2L)
+        if (duration < MIN_SECONDS) {
+            file.delete()
+            throw IllegalStateException("Se grabaron solo $duration segundos. Prueba de nuevo")
+        }
+        val rms = if (sampleCount > 0) sqrt(sumOfSquares / sampleCount) else 0.0
+        if (clientSilenced) {
+            file.delete()
+            throw IllegalStateException(
+                "Android silenció el micrófono de Vibra. Cierra otras apps que estén grabando " +
+                    "y deja Vibra abierta en primer plano durante la escucha."
+            )
+        }
+        if (rms < DIGITAL_SILENCE_RMS || maxSample <= 2) {
+            file.delete()
+            throw IllegalStateException(
+                "La grabación está prácticamente vacía (nivel RMS=${rms.toInt()}, " +
+                    "pico=$maxSample). Comprueba que el acceso global al micrófono esté " +
+                    "activado y prueba a grabar una nota de voz. Si utilizas un emulador, " +
+                    "prueba Vibra en un teléfono real."
+            )
+        }
+        // El audio tenue pero real se envía a ACRCloud. Evitamos rechazarlo con el antiguo MIN_RMS=100.
+        if (bytes > Int.MAX_VALUE - WAV_HEADER_BYTES) {
+            file.delete()
+            throw IOException("El archivo de audio excede el tamaño permitido")
+        }
+        writeWavHeader(file, bytes.toInt())
+        return file
+    }
+
+    @Synchronized
+    fun discard() {
+        stopHardware()
+        outputFile?.delete()
+        outputFile = null
+    }
+
+    private fun stopHardware() {
+        isCapturing = false
+        val input = recorder
+        recorder = null
+        if (input != null) {
+            runCatching { input.stop() }
+        }
+        val thread = worker
+        if (thread != null) {
+            try {
+                thread.join(3_000)
+            } catch (ex: InterruptedException) {
+                Thread.currentThread().interrupt()
+                workerError = ex
+            }
+        }
+        worker = null
+        input?.release()
+        if (thread?.isAlive == true) {
+            throw IOException("La grabación no pudo finalizar correctamente")
+        }
+    }
+
+    private fun writeWavHeader(file: File, pcmBytes: Int) {
+        val byteRate = SAMPLE_RATE * 2 // mono, 16 bits
+        RandomAccessFile(file, "rw").use { wav ->
+            wav.seek(0)
+            fun ascii(value: String) = wav.write(value.toByteArray(Charsets.US_ASCII))
+            fun write16LE(value: Int) {
+                wav.write(value and 0xff)
+                wav.write((value ushr 8) and 0xff)
+            }
+            fun write32LE(value: Int) {
+                for (shift in 0..24 step 8) wav.write((value ushr shift) and 0xff)
+            }
+            ascii("RIFF")
+            write32LE(36 + pcmBytes)
+            ascii("WAVE")
+            ascii("fmt ")
+            write32LE(16)
+            write16LE(1) // PCM
+            write16LE(1) // 1 canal
+            write32LE(SAMPLE_RATE)
+            write32LE(byteRate)
+            write16LE(2) // block align
+            write16LE(16) // bits por muestra
+            ascii("data")
+            write32LE(pcmBytes)
+        }
+    }
+}
+
+
+========================================================================================
+app/src/main/java/com/vibra/app/data/AcrCloudClient.kt
+========================================================================================
+
+package com.vibra.app.data
+
+import org.json.JSONArray
+import org.json.JSONObject
+import java.io.ByteArrayOutputStream
+import java.io.File
+import java.io.IOException
+import java.net.HttpURLConnection
+import java.net.URL
+import java.util.UUID
+import javax.crypto.Mac
+import javax.crypto.spec.SecretKeySpec
+import java.util.Base64
+
+/** Configuración del proyecto de reconocimiento musical de ACRCloud. */
+data class AcrCredentials(
+    val host: String = "",
+    val accessKey: String = "",
+    val accessSecret: String = ""
+) {
+    fun isConfigured(): Boolean = host.isNotBlank() && accessKey.isNotBlank() && accessSecret.isNotBlank()
+
+    fun normalizedHost(): String = host.trim()
+        .removePrefix("https://")
+        .trimEnd('/')
+        .removeSuffix("/v1/identify")
+        .lowercase()
+}
+
+/** API REST de ACRCloud v1: WAV 11 s + HMAC-SHA1 multipart HTTPS. */
+class AcrCloudClient {
+    fun identify(recording: File, credentials: AcrCredentials): Song? {
+        require(credentials.isConfigured()) { "Configura Host, Access Key y Access Secret de ACRCloud en Ajustes." }
+        val host = credentials.normalizedHost()
+        if (!Regex("^[a-z0-9-]+(?:\\.[a-z0-9-]+)*\\.acrcloud\\.com$").matches(host)) {
+            throw IllegalArgumentException("El Host debe ser el del proyecto ACRCloud, por ejemplo identify-eu-west-1.acrcloud.com")
+        }
+        if (!recording.isFile || recording.length() <= 44L) {
+            throw IOException("La grabación está vacía")
+        }
+        if (recording.length() >= 5_000_000L) {
+            throw IOException("La muestra supera el máximo de 5 MB de ACRCloud")
+        }
+        val header = ByteArray(12)
+        recording.inputStream().use { input ->
+            if (input.read(header) != header.size ||
+                String(header, 0, 4, Charsets.US_ASCII) != "RIFF" ||
+                String(header, 8, 4, Charsets.US_ASCII) != "WAVE") {
+                throw IOException("El micrófono no produjo un WAV válido")
+            }
+        }
+
+        val timestamp = (System.currentTimeMillis() / 1000L).toString()
+        val accessKey = credentials.accessKey.trim()
+        val dataToSign = "POST\n/v1/identify\n$accessKey\naudio\n1\n$timestamp"
+        val signer = Mac.getInstance("HmacSHA1")
+        signer.init(SecretKeySpec(credentials.accessSecret.trim().toByteArray(Charsets.UTF_8), "HmacSHA1"))
+        val signature = Base64.getEncoder().encodeToString(signer.doFinal(dataToSign.toByteArray(Charsets.UTF_8)))
+        val boundary = "Vibra${UUID.randomUUID()}"
+        val prefix = ByteArrayOutputStream().apply {
+            fun put(value: String) = write(value.toByteArray(Charsets.UTF_8))
+            fun field(name: String, value: String) {
+                put("--$boundary\r\n")
+                put("Content-Disposition: form-data; name=\"$name\"\r\n\r\n")
+                put(value)
+                put("\r\n")
+            }
+            field("access_key", accessKey)
+            field("sample_bytes", recording.length().toString())
+            field("timestamp", timestamp)
+            field("signature", signature)
+            field("data_type", "audio")
+            field("signature_version", "1")
+            put("--$boundary\r\n")
+            put("Content-Disposition: form-data; name=\"sample\"; filename=\"vibra.wav\"\r\n")
+            put("Content-Type: audio/wav\r\n\r\n")
+        }.toByteArray()
+        val suffix = "\r\n--$boundary--\r\n".toByteArray(Charsets.UTF_8)
+        val connection = URL("https://$host/v1/identify").openConnection() as HttpURLConnection
+        try {
+            connection.requestMethod = "POST"
+            connection.connectTimeout = 20_000
+            connection.readTimeout = 40_000
+            connection.doOutput = true
+            connection.setRequestProperty("Content-Type", "multipart/form-data; boundary=$boundary")
+            connection.setRequestProperty("Accept", "application/json")
+            connection.setFixedLengthStreamingMode(prefix.size.toLong() + recording.length() + suffix.size)
+            connection.outputStream.use { out ->
+                out.write(prefix)
+                recording.inputStream().buffered().use { input -> input.copyTo(out) }
+                out.write(suffix)
+            }
+            val httpStatus = connection.responseCode
+            val stream = if (httpStatus in 200..299) connection.inputStream else connection.errorStream
+            val raw = stream?.bufferedReader()?.use { it.readText() }
+                ?: throw IOException("ACRCloud no respondió con datos (HTTP $httpStatus)")
+            val root = try { JSONObject(raw) } catch (ex: Exception) {
+                throw IOException("ACRCloud devolvió una respuesta inválida (HTTP $httpStatus)", ex)
+            }
+            val status = root.optJSONObject("status")
+            val code = status?.optInt("code", -1) ?: -1
+            if (code == 1001) return null // No Result: respuesta normal cuando no hay coincidencia.
+            if (httpStatus !in 200..299 || code != 0) {
+                val reason = status?.optString("msg").orEmpty().take(160)
+                val explanation = when (code) {
+                    3001, 3014 -> "Credenciales incorrectas o servicio no autorizado"
+                    2004, 2005, 2006 -> "ACRCloud no pudo analizar el audio; comprueba el micrófono"
+                    else -> reason.ifBlank { "Revisa las credenciales, el Host y la cuota de ACRCloud" }
+                }
+                throw IOException("ACRCloud: $explanation (código $code, HTTP $httpStatus)")
+            }
+            val music = root.optJSONObject("metadata")?.optJSONArray("music") ?: return null
+            val match = music.optJSONObject(0) ?: return null
+            val title = match.optString("title").ifBlank { "Canción desconocida" }
+            val artists = match.optJSONArray("artists")
+            val artist = (0 until (artists?.length() ?: 0))
+                .mapNotNull { artists?.optJSONObject(it)?.optNullableString("name") }
+                .joinToString(", ").ifBlank { "Artista desconocido" }
+            val album = match.optJSONObject("album")?.optString("name").orEmpty()
+            val metadata = match.optJSONObject("external_metadata")
+            val spotify = firstJson(metadata?.opt("spotify"))
+            val spotifyId = spotify?.optJSONObject("track")?.optNullableString("id")
+            val spotifyUrl = if (spotifyId != null && Regex("^[A-Za-z0-9]{22}$").matches(spotifyId)) {
+                "https://open.spotify.com/track/$spotifyId"
+            } else null
+            // ACRCloud no garantiza portada en el resultado básico: la UI conserva su icono de respaldo.
+            return Song(
+                title = title,
+                artist = artist,
+                album = album,
+                artworkUrl = null,
+                songLink = spotifyUrl,
+                spotifyUrl = spotifyUrl
+            )
+        } finally {
+            connection.disconnect()
+        }
+    }
+
+    private fun firstJson(value: Any?): JSONObject? = when (value) {
+        is JSONObject -> value
+        is JSONArray -> value.optJSONObject(0)
+        else -> null
+    }
+}
+
+
+========================================================================================
+app/src/main/java/com/vibra/app/data/Song.kt
+========================================================================================
+
+package com.vibra.app.data
+
+import org.json.JSONObject
+
+data class Song(
+    val title: String,
+    val artist: String,
+    val album: String,
+    val artworkUrl: String?,
+    val songLink: String?,
+    val spotifyUrl: String?,
+    val recognizedAt: Long = System.currentTimeMillis()
+) {
+    fun toJson(): JSONObject = JSONObject().apply {
+        put("title", title)
+        put("artist", artist)
+        put("album", album)
+        put("artworkUrl", artworkUrl)
+        put("songLink", songLink)
+        put("spotifyUrl", spotifyUrl)
+        put("recognizedAt", recognizedAt)
+    }
+
+    companion object {
+        fun fromJson(json: JSONObject): Song = Song(
+            title = json.optString("title", "Desconocida"),
+            artist = json.optString("artist", "Artista desconocido"),
+            album = json.optString("album", "Sin álbum"),
+            artworkUrl = json.optNullableString("artworkUrl"),
+            songLink = json.optNullableString("songLink"),
+            spotifyUrl = json.optNullableString("spotifyUrl"),
+            recognizedAt = json.optLong("recognizedAt", System.currentTimeMillis())
+        )
+    }
+}
+
+internal fun JSONObject.optNullableString(key: String): String? =
+    if (isNull(key)) null else optString(key).takeIf { it.isNotBlank() && it != "null" }
+
+
+========================================================================================
+app/src/main/java/com/vibra/app/data/VibraPreferences.kt
+========================================================================================
+
+package com.vibra.app.data
+
+import android.content.Context
+import org.json.JSONArray
+
+/** Demostración local. Para producción, el access_secret debe protegerse en un backend. */
+class VibraPreferences(context: Context) {
+    private val prefs = context.applicationContext.getSharedPreferences("vibra", Context.MODE_PRIVATE)
+
+    var acrCredentials: AcrCredentials
+        get() = AcrCredentials(
+            host = prefs.getString("acr_host", "").orEmpty(),
+            accessKey = prefs.getString("acr_key", "").orEmpty(),
+            accessSecret = prefs.getString("acr_secret", "").orEmpty()
+        )
+        set(value) {
+            prefs.edit()
+                .putString("acr_host", value.normalizedHost())
+                .putString("acr_key", value.accessKey.trim())
+                .putString("acr_secret", value.accessSecret.trim())
+                .apply()
+        }
+
+    fun getHistory(): List<Song> = runCatching {
+        val array = JSONArray(prefs.getString("history", "[]"))
+        (0 until array.length()).mapNotNull { index ->
+            runCatching { Song.fromJson(array.getJSONObject(index)) }.getOrNull()
+        }.sortedByDescending { it.recognizedAt }
+    }.getOrDefault(emptyList())
+
+    fun saveSong(song: Song) {
+        val current = getHistory().filterNot {
+            it.title.equals(song.title, ignoreCase = true) &&
+                it.artist.equals(song.artist, ignoreCase = true)
+        }
+        val array = JSONArray()
+        (listOf(song) + current).take(50).forEach { array.put(it.toJson()) }
+        prefs.edit().putString("history", array.toString()).apply()
+    }
+
+    fun clearHistory() {
+        prefs.edit().remove("history").apply()
+    }
+}
+
+
+========================================================================================
+app/src/main/java/com/vibra/app/ui/VibraApp.kt
+========================================================================================
+
+package com.vibra.app.ui
+
+import androidx.activity.compose.BackHandler
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material.icons.filled.ArrowForward
+import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.DeleteOutline
+import androidx.compose.material.icons.filled.GraphicEq
+import androidx.compose.material.icons.filled.Headphones
+import androidx.compose.material.icons.filled.History
+import androidx.compose.material.icons.filled.Home
+import androidx.compose.material.icons.filled.Info
+import androidx.compose.material.icons.filled.Key
+import androidx.compose.material.icons.filled.Lock
+import androidx.compose.material.icons.filled.Mic
+import androidx.compose.material.icons.filled.MusicNote
+import androidx.compose.material.icons.filled.OpenInNew
+import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Security
+import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.Share
+import androidx.compose.material.icons.filled.Stop
+import androidx.compose.material.icons.filled.WarningAmber
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.material3.darkColorScheme
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import coil.compose.AsyncImage
+import com.vibra.app.R
+import com.vibra.app.ScanPhase
+import com.vibra.app.VibraState
+import com.vibra.app.data.AcrCredentials
+import com.vibra.app.data.Song
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import kotlin.math.abs
+import kotlin.math.sin
+
+// Vibra 1.2: interfaz visual renovada. El grabador, el cliente ACRCloud y el historial
+// se mantienen intactos; no se presentan datos simulados como resultados reales.
+private val Night = Color(0xFF050718)
+private val DeepBlue = Color(0xFF08133A)
+private val Glass = Color(0xE0162248)
+private val Cyan = Color(0xFF27D9FF)
+private val Electric = Color(0xFF256CFF)
+private val Violet = Color(0xFF9A4AFF)
+private val Ice = Color(0xFFF6F8FF)
+private val Muted = Color(0xFFADB9DC)
+private val Green = Color(0xFF17DBA2)
+private val Rose = Color(0xFFFF80BF)
+private val Border = Color(0x465C79D9)
+private val Gradient = listOf(Cyan, Electric, Violet)
+private const val RECORD_SECONDS = 11
+
+private val VibraColors = darkColorScheme(
+    primary = Cyan, onPrimary = Night, secondary = Violet,
+    background = Night, onBackground = Ice, surface = DeepBlue, onSurface = Ice
+)
+
+private enum class Page { HOME, HISTORY, SETTINGS, RESULT }
+
+@Composable
+fun VibraApp(
+    state: VibraState,
+    onListen: () -> Unit,
+    onSaveCredentials: (AcrCredentials) -> Unit,
+    onClearHistory: () -> Unit,
+    onOpenLink: (String) -> Unit,
+    onShareSong: (Song) -> Unit = {}
+) {
+    var page by rememberSaveable { mutableStateOf(Page.HOME) }
+    var resultSource by rememberSaveable { mutableStateOf(Page.HOME) }
+    var shownSong by remember { mutableStateOf<Song?>(null) }
+    var lastShownRecognition by rememberSaveable { mutableStateOf<Long?>(null) }
+
+    // Cuando se reconoce una canción se abre la pantalla de resultados automáticamente.
+    LaunchedEffect(state.phase, state.song?.recognizedAt) {
+        val song = state.song
+        if (state.phase == ScanPhase.FOUND && song != null && lastShownRecognition != song.recognizedAt) {
+            shownSong = song
+            lastShownRecognition = song.recognizedAt
+            resultSource = Page.HOME
+            page = Page.RESULT
+        }
+    }
+
+    BackHandler(enabled = page == Page.RESULT) { page = resultSource }
+    MaterialTheme(colorScheme = VibraColors) {
+        Box(Modifier.fillMaxSize()) {
+            AtmosphericBackground()
+            Scaffold(
+                containerColor = Color.Transparent,
+                bottomBar = {
+                    if (page != Page.RESULT) {
+                        VibraNavigationBar(page) { page = it }
+                    }
+                }
+            ) { scaffoldPadding ->
+                Box(
+                    modifier = Modifier.fillMaxSize().padding(scaffoldPadding),
+                    contentAlignment = Alignment.TopCenter
+                ) {
+                    Column(
+                        Modifier.fillMaxWidth().widthIn(max = 560.dp)
+                            .padding(horizontal = 22.dp)
+                    ) {
+                        when (page) {
+                            Page.HOME -> HomePage(
+                                state = state,
+                                onListen = onListen,
+                                onSettings = { page = Page.SETTINGS }
+                            )
+                            Page.HISTORY -> HistoryPage(
+                                history = state.history,
+                                onClear = onClearHistory,
+                                onSelect = { song ->
+                                    shownSong = song
+                                    resultSource = Page.HISTORY
+                                    page = Page.RESULT
+                                }
+                            )
+                            Page.SETTINGS -> SettingsPage(state.acrCredentials, onSaveCredentials)
+                            Page.RESULT -> shownSong?.let { song ->
+                                ResultPage(
+                                    song = song,
+                                    onBack = { page = resultSource },
+                                    onOpenLink = onOpenLink,
+                                    onShare = { onShareSong(song) }
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun AtmosphericBackground() {
+    Canvas(Modifier.fillMaxSize()) {
+        drawRect(Brush.verticalGradient(listOf(Night, Color(0xFF080E2A), Color(0xFF100930), Night)))
+        drawCircle(
+            brush = Brush.radialGradient(
+                listOf(Electric.copy(alpha = .26f), Electric.copy(alpha = .06f), Color.Transparent),
+                center = Offset(size.width * .05f, size.height * .22f),
+                radius = size.width * .88f
+            ),
+            center = Offset(size.width * .05f, size.height * .22f), radius = size.width * .88f
+        )
+        drawCircle(
+            brush = Brush.radialGradient(
+                listOf(Violet.copy(alpha = .18f), Violet.copy(alpha = .04f), Color.Transparent),
+                center = Offset(size.width, size.height * .75f),
+                radius = size.width * .8f
+            ),
+            center = Offset(size.width, size.height * .75f), radius = size.width * .8f
+        )
+    }
+}
+
+@Composable
+private fun BrandHeader(compact: Boolean = false) {
+    Row(
+        Modifier.fillMaxWidth().padding(top = if (compact) 12.dp else 23.dp, bottom = 12.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(10.dp)
+    ) {
+        Image(
+            painter = painterResource(R.drawable.vibra_mark),
+            contentDescription = "Logotipo de Vibra",
+            modifier = Modifier.size(if (compact) 39.dp else 48.dp)
+        )
+        Text(
+            "vibra", fontSize = if (compact) 26.sp else 31.sp,
+            fontWeight = FontWeight.ExtraBold, letterSpacing = (-1).sp, color = Ice
+        )
+        Spacer(Modifier.weight(1f))
+        if (!compact) {
+            Box(
+                Modifier.clip(CircleShape).background(Color.White.copy(alpha = .06f))
+                    .border(1.dp, Border, CircleShape).padding(horizontal = 12.dp, vertical = 7.dp)
+            ) {
+                Text("MUSIC ID", color = Muted, fontSize = 9.sp,
+                    fontWeight = FontWeight.Bold, letterSpacing = 1.7.sp)
+            }
+        }
+    }
+}
+
+@Composable
+private fun HomePage(state: VibraState, onListen: () -> Unit, onSettings: () -> Unit) {
+    val isRecording = state.phase == ScanPhase.RECORDING
+    val isLoading = state.phase == ScanPhase.IDENTIFYING
+    Column(
+        Modifier.fillMaxWidth().verticalScroll(rememberScrollState()),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        BrandHeader()
+        Spacer(Modifier.height(25.dp))
+        Text(
+            if (isRecording) "Escuchando..." else if (isLoading) "Identificando..." else "Siente la música",
+            fontSize = 29.sp, fontWeight = FontWeight.Bold, color = Ice, textAlign = TextAlign.Center
+        )
+        Spacer(Modifier.height(8.dp))
+        Text(
+            when (state.phase) {
+                ScanPhase.RECORDING -> "Buscando la canción que está sonando"
+                ScanPhase.IDENTIFYING -> "Consultando ACRCloud"
+                else -> "Descubre el nombre de cualquier canción"
+            },
+            fontSize = 14.sp, color = Muted, textAlign = TextAlign.Center
+        )
+        Spacer(Modifier.height(18.dp))
+        ListeningOrb(
+            listening = isRecording,
+            processing = isLoading,
+            level = state.inputLevel,
+            onClick = onListen
+        )
+        Spacer(Modifier.height(2.dp))
+        Text(
+            when (state.phase) {
+                ScanPhase.RECORDING -> "${state.secondsRemaining} s restantes"
+                ScanPhase.IDENTIFYING -> "Analizando tu fragmento de audio"
+                ScanPhase.FOUND -> "Canción reconocida"
+                ScanPhase.ERROR -> "No se pudo reconocer"
+                ScanPhase.NO_MATCH -> "No encontramos coincidencias"
+                ScanPhase.IDLE -> "Toca para identificar"
+            },
+            fontSize = 15.sp, color = Ice, fontWeight = FontWeight.SemiBold, textAlign = TextAlign.Center
+        )
+        Spacer(Modifier.height(5.dp))
+        Text(
+            when (state.phase) {
+                ScanPhase.RECORDING -> "Toca el botón para cancelar"
+                ScanPhase.IDENTIFYING -> "Este proceso requiere conexión a Internet"
+                else -> "Acerca tu dispositivo a la música"
+            },
+            color = Muted, fontSize = 12.sp, textAlign = TextAlign.Center
+        )
+        Spacer(Modifier.height(20.dp))
+        AudioVisualizer(isRecording, state.inputLevel)
+        Spacer(Modifier.height(23.dp))
+        when (state.phase) {
+            ScanPhase.ERROR -> FeedbackCard(
+                title = "No se pudo identificar",
+                body = state.errorMessage ?: "Ocurrió un problema al reconocer música.",
+                isError = true
+            )
+            ScanPhase.NO_MATCH -> FeedbackCard(
+                title = "Sin coincidencias",
+                body = "Intenta de nuevo con la música más cerca y menos ruido de fondo.",
+                isError = false
+            )
+            ScanPhase.RECORDING -> {
+                if (state.inputLevel < .02f) {
+                    FeedbackCard("Señal de micrófono baja", "Comprueba que el audio se esté reproduciendo cerca del teléfono.", false)
+                } else {
+                    FeedbackCard("Micrófono activo", "Estamos capturando un fragmento para identificarlo.", false)
+                }
+            }
+            ScanPhase.IDENTIFYING -> FeedbackCard("Buscando coincidencias", "Comparando el audio con la base de datos musical.", false)
+            else -> WelcomeCard(onSettings)
+        }
+        Spacer(Modifier.height(22.dp))
+    }
+}
+
+@Composable
+private fun ListeningOrb(listening: Boolean, processing: Boolean, level: Float, onClick: () -> Unit) {
+    val animation = rememberInfiniteTransition(label = "vibraOrb")
+    val pulse by animation.animateFloat(
+        initialValue = 0f, targetValue = 1f,
+        animationSpec = infiniteRepeatable(tween(1800, easing = FastOutSlowInEasing), RepeatMode.Reverse),
+        label = "orbPulse"
+    )
+    val intensity = if (listening) (.55f + level.coerceIn(0f, 1f) * .7f) else .24f
+    Box(Modifier.size(295.dp), contentAlignment = Alignment.Center) {
+        Canvas(Modifier.fillMaxSize()) {
+            val cx = size.width / 2
+            val cy = size.height / 2
+            val center = Offset(cx, cy)
+            val circle = size.minDimension * .325f
+            drawCircle(
+                brush = Brush.radialGradient(
+                    listOf(Violet.copy(alpha = .22f + intensity * .16f),
+                        Electric.copy(alpha = .14f), Color.Transparent),
+                    center = center, radius = size.minDimension * .5f
+                ), radius = size.minDimension * .5f, center = center
+            )
+            repeat(3) { index ->
+                val p = if (listening || processing) pulse else .30f
+                val radius = circle + (22f + index * 18f + p * (8f + index * 3f)).dp.toPx()
+                drawCircle(
+                    brush = Brush.sweepGradient(
+                        colors = listOf(Cyan.copy(alpha = .18f), Cyan.copy(alpha = .8f),
+                            Violet.copy(alpha = .65f), Cyan.copy(alpha = .18f)), center = center
+                    ),
+                    radius = radius,
+                    center = center,
+                    style = Stroke(width = (1.6f - index * .3f).dp.toPx())
+                )
+            }
+            drawCircle(
+                brush = Brush.linearGradient(listOf(Cyan, Electric, Violet),
+                    start = Offset(cx - circle, cy - circle), end = Offset(cx + circle, cy + circle)),
+                radius = circle + 3.dp.toPx(), center = center
+            )
+            drawCircle(
+                brush = Brush.radialGradient(
+                    listOf(Color(0xFF154CDA), Color(0xFF0641C2), Color(0xFF4317A0), Color(0xFF6C1AB1)),
+                    center = Offset(cx - circle * .4f, cy - circle * .5f), radius = circle * 2.0f
+                ), radius = circle, center = center
+            )
+            drawCircle(
+                brush = Brush.sweepGradient(Gradient + Cyan, center), radius = circle,
+                center = center, style = Stroke(width = 2.4.dp.toPx())
+            )
+        }
+        Box(
+            Modifier.size(197.dp).clip(CircleShape).clickable(enabled = !processing, onClick = onClick),
+            contentAlignment = Alignment.Center
+        ) {
+            if (processing) {
+                CircularProgressIndicator(
+                    color = Ice, strokeWidth = 4.dp,
+                    modifier = Modifier.size(74.dp)
+                )
+            } else {
+                Icon(
+                    if (listening) Icons.Filled.Stop else Icons.Filled.Mic,
+                    contentDescription = if (listening) "Cancelar reconocimiento" else "Reconocer canción",
+                    modifier = Modifier.size(77.dp), tint = Ice
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun AudioVisualizer(active: Boolean, level: Float) {
+    val movement = rememberInfiniteTransition(label = "ecualizador")
+    val oscillation by movement.animateFloat(
+        0f, 1f, infiniteRepeatable(tween(600), RepeatMode.Reverse), label = "barras"
+    )
+    Row(
+        Modifier.fillMaxWidth().height(42.dp),
+        horizontalArrangement = Arrangement.Center, verticalAlignment = Alignment.CenterVertically
+    ) {
+        repeat(27) { i ->
+            val normalized = abs(i - 13) / 13f
+            val shape = (1f - normalized * .87f).coerceAtLeast(.08f)
+            val activity = if (active) .35f + .65f * level.coerceIn(0f, 1f) else .62f
+            val variation = if (active) .7f + .3f * abs(sin((i + 1) * .7f + oscillation * 6f)) else 1f
+            val barHeight = (5f + 33f * shape * activity * variation).dp
+            Box(
+                Modifier.padding(horizontal = 1.6.dp).width(3.1.dp).height(barHeight)
+                    .clip(CircleShape)
+                    .background(if (i < 13) Cyan else if (i < 18) Electric else Violet)
+            )
+        }
+    }
+}
+
+@Composable
+private fun WelcomeCard(onSettings: () -> Unit) {
+    GlassCard {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Icon(Icons.Filled.Headphones, null, tint = Cyan, modifier = Modifier.size(25.dp))
+            Spacer(Modifier.width(13.dp))
+            Column(Modifier.weight(1f)) {
+                Text("Tu próxima canción favorita", fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                Spacer(Modifier.height(4.dp))
+                Text("Escucha, identifica y consulta tus descubrimientos cuando quieras.",
+                    fontSize = 12.sp, lineHeight = 18.sp, color = Muted)
+            }
+        }
+        Spacer(Modifier.height(14.dp))
+        TextButton(onClick = onSettings, contentPadding = PaddingValues(0.dp)) {
+            Text("Configurar ACRCloud", color = Cyan, fontSize = 12.sp)
+            Spacer(Modifier.width(6.dp))
+            Icon(Icons.Filled.ArrowForward, null, tint = Cyan, modifier = Modifier.size(17.dp))
+        }
+    }
+}
+
+@Composable
+private fun FeedbackCard(title: String, body: String, isError: Boolean) {
+    GlassCard(accent = if (isError) Rose else Cyan) {
+        Row(verticalAlignment = Alignment.Top) {
+            Icon(if (isError) Icons.Filled.WarningAmber else Icons.Filled.Info,
+                contentDescription = null, tint = if (isError) Rose else Cyan,
+                modifier = Modifier.size(24.dp))
+            Spacer(Modifier.width(12.dp))
+            Column(Modifier.weight(1f)) {
+                Text(title, color = Ice, fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                Spacer(Modifier.height(5.dp))
+                Text(body, color = Muted, fontSize = 12.sp, lineHeight = 18.sp)
+            }
+        }
+    }
+}
+
+@Composable
+private fun GlassCard(
+    modifier: Modifier = Modifier,
+    accent: Color = Cyan,
+    content: @Composable ColumnScope.() -> Unit
+) {
+    val shape = RoundedCornerShape(21.dp)
+    Column(
+        modifier.fillMaxWidth().clip(shape)
+            .background(Brush.linearGradient(listOf(Glass, Color(0xE01A1340))))
+            .border(1.dp, Brush.linearGradient(listOf(accent.copy(alpha = .45f), Border, Violet.copy(alpha = .3f))), shape)
+            .padding(17.dp),
+        content = content
+    )
+}
+
+@Composable
+private fun VibraNavigationBar(current: Page, onNavigate: (Page) -> Unit) {
+    val shape = RoundedCornerShape(28.dp)
+    Row(
+        Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 11.dp)
+            .clip(shape)
+            .background(Color(0xEC0C1639))
+            .border(1.dp, Border, shape)
+            .padding(6.dp),
+        horizontalArrangement = Arrangement.spacedBy(4.dp)
+    ) {
+        val destinations = listOf(
+            Triple(Page.HOME, "Inicio", Icons.Filled.Home),
+            Triple(Page.HISTORY, "Historial", Icons.Filled.History),
+            Triple(Page.SETTINGS, "Ajustes", Icons.Filled.Settings)
+        )
+        destinations.forEach { (destination, label, icon) ->
+            val selected = current == destination
+            Column(
+                modifier = Modifier.weight(1f).clip(RoundedCornerShape(22.dp))
+                    .background(if (selected) Brush.linearGradient(listOf(Electric.copy(alpha=.87f),Violet.copy(alpha=.76f)))
+                        else Brush.linearGradient(listOf(Color.Transparent, Color.Transparent)))
+                    .clickable { onNavigate(destination) }
+                    .padding(vertical = 9.dp, horizontal = 3.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                Icon(icon, contentDescription = label,
+                    tint = if (selected) Ice else Muted, modifier = Modifier.size(21.dp))
+                Spacer(Modifier.height(2.dp))
+                Text(label, color = if (selected) Ice else Muted,
+                    fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal,
+                    fontSize = 10.sp)
+            }
+        }
+    }
+}
+
+@Composable
+private fun HistoryPage(history: List<Song>, onClear: () -> Unit, onSelect: (Song) -> Unit) {
+    var confirmClear by remember { mutableStateOf(false) }
+    Column(Modifier.fillMaxSize()) {
+        BrandHeader(compact = true)
+        Spacer(Modifier.height(18.dp))
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Column(Modifier.weight(1f)) {
+                Text("Tu historial", fontSize = 30.sp, fontWeight = FontWeight.Bold)
+                Spacer(Modifier.height(4.dp))
+                Text("${history.size} ${if (history.size == 1) "canción identificada" else "canciones identificadas"}",
+                    color = Muted, fontSize = 13.sp)
+            }
+            if (history.isNotEmpty()) {
+                IconButton(onClick = { confirmClear = true }) {
+                    Icon(Icons.Filled.DeleteOutline, "Borrar historial", tint = Rose)
+                }
+            }
+        }
+        Spacer(Modifier.height(24.dp))
+        if (history.isEmpty()) {
+            GlassCard {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Filled.History, null, tint = Cyan, modifier = Modifier.size(33.dp))
+                    Spacer(Modifier.width(12.dp))
+                    Column {
+                        Text("Todavía no hay canciones", fontWeight = FontWeight.SemiBold)
+                        Spacer(Modifier.height(4.dp))
+                        Text("Lo que descubras aparecerá aquí.", fontSize = 12.sp, color = Muted)
+                    }
+                }
+            }
+        } else {
+            LazyColumn(
+                Modifier.fillMaxWidth(),
+                contentPadding = PaddingValues(bottom = 20.dp),
+                verticalArrangement = Arrangement.spacedBy(11.dp)
+            ) {
+                items(history, key = { "${it.title}-${it.artist}-${it.recognizedAt}" }) { song ->
+                    SongHistoryRow(song) { onSelect(song) }
+                }
+            }
+        }
+    }
+    if (confirmClear) {
+        AlertDialog(
+            onDismissRequest = { confirmClear = false },
+            title = { Text("¿Borrar historial?") },
+            text = { Text("Se eliminarán los reconocimientos guardados en este dispositivo.") },
+            confirmButton = {
+                TextButton(onClick = { onClear(); confirmClear = false }) { Text("Borrar", color = Rose) }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmClear = false }) { Text("Cancelar") }
+            }
+        )
+    }
+}
+
+@Composable
+private fun SongHistoryRow(song: Song, onClick: () -> Unit) {
+    val formatter = remember { SimpleDateFormat("dd MMM · HH:mm", Locale("es", "MX")) }
+    val shape = RoundedCornerShape(18.dp)
+    Row(
+        Modifier.fillMaxWidth().clip(shape).background(Glass).border(1.dp, Border, shape)
+            .clickable(onClick = onClick).padding(11.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        AlbumArt(song, 60.dp)
+        Spacer(Modifier.width(12.dp))
+        Column(Modifier.weight(1f)) {
+            Text(song.title, color = Ice, fontWeight = FontWeight.Bold, fontSize = 14.sp,
+                maxLines = 1, overflow = TextOverflow.Ellipsis)
+            Text(song.artist, fontSize = 12.sp, color = Muted,
+                maxLines = 1, overflow = TextOverflow.Ellipsis)
+            Spacer(Modifier.height(3.dp))
+            Text(formatter.format(Date(song.recognizedAt)), color = Muted.copy(alpha = .75f), fontSize = 11.sp)
+        }
+        Icon(Icons.Filled.ArrowForward, contentDescription = "Ver resultado", tint = Cyan,
+            modifier = Modifier.size(20.dp))
+    }
+}
+
+@Composable
+private fun AlbumArt(song: Song, size: Dp, modifier: Modifier = Modifier) {
+    val shape = RoundedCornerShape(20.dp)
+    Box(modifier.size(size).clip(shape), contentAlignment = Alignment.Center) {
+        Box(Modifier.fillMaxSize().background(Brush.linearGradient(
+            listOf(Color(0xFF01C6F3), Color(0xFF174EE6), Color(0xFF6226D8), Color(0xFFBD42F4))
+        )))
+        Canvas(Modifier.fillMaxSize()) {
+            drawCircle(
+                Brush.radialGradient(listOf(Color(0xFFF6A9F8), Violet, Color.Transparent),
+                    center = Offset(this.size.width * .55f, this.size.height * .40f),
+                    radius = this.size.width * .52f),
+                radius = this.size.width * .52f,
+                center = Offset(this.size.width * .55f, this.size.height * .40f)
+            )
+        }
+        Icon(Icons.Filled.MusicNote, null, tint = Ice.copy(alpha = .95f), modifier = Modifier.size(size * .40f))
+        if (!song.artworkUrl.isNullOrBlank()) {
+            AsyncImage(
+                model = song.artworkUrl, contentDescription = "Portada de ${song.title}",
+                contentScale = ContentScale.Crop, modifier = Modifier.fillMaxSize()
+            )
+        }
+    }
+}
+
+@Composable
+private fun ResultPage(
+    song: Song,
+    onBack: () -> Unit,
+    onOpenLink: (String) -> Unit,
+    onShare: () -> Unit
+) {
+    val spotifyUrl = song.spotifyUrl
+    val fallbackUrl = song.songLink
+    Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()),
+        horizontalAlignment = Alignment.CenterHorizontally) {
+        Row(Modifier.fillMaxWidth().padding(top = 12.dp), verticalAlignment = Alignment.CenterVertically) {
+            IconButton(onClick = onBack) { Icon(Icons.Filled.ArrowBack, "Regresar", tint = Ice) }
+            Spacer(Modifier.weight(1f))
+            Text("Resultado", fontSize = 17.sp, fontWeight = FontWeight.Bold)
+            Spacer(Modifier.weight(1f))
+            IconButton(onClick = onShare) { Icon(Icons.Filled.Share, "Compartir canción", tint = Ice) }
+        }
+        Spacer(Modifier.height(34.dp))
+        AlbumArt(song, 246.dp)
+        Spacer(Modifier.height(28.dp))
+        Text(song.title, fontSize = 28.sp, fontWeight = FontWeight.ExtraBold,
+            textAlign = TextAlign.Center, lineHeight = 33.sp)
+        Spacer(Modifier.height(5.dp))
+        Text(song.artist, fontSize = 17.sp, color = Muted, textAlign = TextAlign.Center)
+        if (song.album.isNotBlank()) {
+            Spacer(Modifier.height(5.dp))
+            Text(song.album, fontSize = 13.sp, color = Muted, textAlign = TextAlign.Center)
+        }
+        Spacer(Modifier.height(25.dp))
+        Row(
+            Modifier.clip(CircleShape).background(Green.copy(alpha = .10f))
+                .border(1.dp, Green.copy(alpha=.55f), CircleShape)
+                .padding(horizontal = 14.dp, vertical = 7.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(7.dp)
+        ) {
+            Icon(Icons.Filled.CheckCircle, contentDescription = null, tint = Green, modifier = Modifier.size(17.dp))
+            Text("Reconocimiento exitoso", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Green)
+        }
+        Spacer(Modifier.height(26.dp))
+        val url = spotifyUrl ?: fallbackUrl
+        Button(
+            onClick = { url?.let(onOpenLink) }, enabled = url != null,
+            modifier = Modifier.fillMaxWidth().height(55.dp),
+            shape = RoundedCornerShape(18.dp),
+            colors = ButtonDefaults.buttonColors(
+                containerColor = Green, contentColor = Night,
+                disabledContainerColor = Color.White.copy(alpha=.11f),
+                disabledContentColor = Muted
+            )
+        ) {
+            Icon(Icons.Filled.PlayArrow, null)
+            Spacer(Modifier.width(9.dp))
+            Text(
+                if (spotifyUrl != null) "Abrir en Spotify"
+                else if (fallbackUrl != null) "Escuchar canción"
+                else "Enlace no disponible",
+                fontWeight = FontWeight.Bold
+            )
+            Spacer(Modifier.width(8.dp))
+            if (url != null) Icon(Icons.Filled.OpenInNew, null, modifier = Modifier.size(18.dp))
+        }
+        Spacer(Modifier.height(11.dp))
+        GlassCard(accent = Violet) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(Icons.Filled.CheckCircle, contentDescription = null, tint = Cyan)
+                Spacer(Modifier.width(11.dp))
+                Column {
+                    Text("Guardada en tu historial", fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                    Text("Vuelve a escucharla desde la sección Historial.", color = Muted,
+                        fontSize = 11.sp, lineHeight = 17.sp)
+                }
+            }
+        }
+        Spacer(Modifier.height(24.dp))
+    }
+}
+
+@Composable
+private fun SettingsPage(credentials: AcrCredentials, onSave: (AcrCredentials) -> Unit) {
+    var host by remember(credentials) { mutableStateOf(credentials.host) }
+    var accessKey by remember(credentials) { mutableStateOf(credentials.accessKey) }
+    var secret by remember(credentials) { mutableStateOf(credentials.accessSecret) }
+    var showKey by rememberSaveable { mutableStateOf(false) }
+    var showSecret by rememberSaveable { mutableStateOf(false) }
+    var saved by remember { mutableStateOf(false) }
+    Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState())) {
+        BrandHeader(compact = true)
+        Spacer(Modifier.height(18.dp))
+        Text("Ajustes", fontSize = 30.sp, fontWeight = FontWeight.Bold)
+        Spacer(Modifier.height(7.dp))
+        Text("Personaliza el reconocimiento de Vibra", color = Muted, fontSize = 13.sp)
+        Spacer(Modifier.height(27.dp))
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Icon(Icons.Filled.GraphicEq, contentDescription = null, tint = Cyan,
+                modifier = Modifier.size(24.dp))
+            Spacer(Modifier.width(10.dp))
+            Column {
+                Text("Configuración de ACRCloud", fontWeight = FontWeight.Bold, fontSize = 16.sp)
+                Text("Conecta tu servicio de reconocimiento", color = Muted, fontSize = 12.sp)
+            }
+        }
+        Spacer(Modifier.height(13.dp))
+        GlassCard {
+            Text("CREDENCIALES DE TU PROYECTO", color = Cyan,
+                fontSize = 10.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.2.sp)
+            Spacer(Modifier.height(15.dp))
+            OutlinedTextField(
+                value = host, onValueChange = { host = it; saved = false },
+                label = { Text("Host") },
+                placeholder = { Text("identify-eu-west-1.acrcloud.com", fontSize = 12.sp) },
+                leadingIcon = { Icon(Icons.Filled.GraphicEq, null, tint = Cyan) },
+                modifier = Modifier.fillMaxWidth(), singleLine = true,
+                shape = RoundedCornerShape(14.dp)
+            )
+            Spacer(Modifier.height(11.dp))
+            OutlinedTextField(
+                value = accessKey, onValueChange = { accessKey = it; saved = false },
+                label = { Text("Access Key") },
+                leadingIcon = { Icon(Icons.Filled.Key, null, tint = Cyan) },
+                trailingIcon = {
+                    TextButton(onClick = { showKey = !showKey }) {
+                        Text(if (showKey) "Ocultar" else "Ver", fontSize = 11.sp)
+                    }
+                },
+                visualTransformation = if (showKey) VisualTransformation.None else PasswordVisualTransformation(),
+                modifier = Modifier.fillMaxWidth(), singleLine = true,
+                shape = RoundedCornerShape(14.dp)
+            )
+            Spacer(Modifier.height(11.dp))
+            OutlinedTextField(
+                value = secret, onValueChange = { secret = it; saved = false },
+                label = { Text("Access Secret") },
+                leadingIcon = { Icon(Icons.Filled.Lock, null, tint = Cyan) },
+                trailingIcon = {
+                    TextButton(onClick = { showSecret = !showSecret }) {
+                        Text(if (showSecret) "Ocultar" else "Ver", fontSize = 11.sp)
+                    }
+                },
+                visualTransformation = if (showSecret) VisualTransformation.None else PasswordVisualTransformation(),
+                modifier = Modifier.fillMaxWidth(), singleLine = true,
+                shape = RoundedCornerShape(14.dp)
+            )
+            Spacer(Modifier.height(20.dp))
+            Button(
+                onClick = { onSave(AcrCredentials(host, accessKey, secret)); saved = true },
+                enabled = host.isNotBlank() && accessKey.isNotBlank() && secret.isNotBlank(),
+                modifier = Modifier.fillMaxWidth().height(52.dp),
+                shape = RoundedCornerShape(16.dp),
+                colors = ButtonDefaults.buttonColors(containerColor = Electric, contentColor = Ice)
+            ) {
+                Icon(Icons.Filled.CheckCircle, null, modifier = Modifier.size(19.dp))
+                Spacer(Modifier.width(9.dp))
+                Text("Guardar configuración", fontWeight = FontWeight.Bold)
+            }
+            if (saved) {
+                Spacer(Modifier.height(11.dp))
+                Text("Configuración guardada en este dispositivo", color = Green, fontSize = 12.sp)
+            }
+        }
+        Spacer(Modifier.height(22.dp))
+        GlassCard(accent = Violet) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(Icons.Filled.Security, null, tint = Cyan, modifier = Modifier.size(25.dp))
+                Spacer(Modifier.width(12.dp))
+                Text("Privacidad y seguridad", fontWeight = FontWeight.Bold, fontSize = 15.sp)
+            }
+            Spacer(Modifier.height(11.dp))
+            Text(
+                "Vibra solo utiliza el micrófono cuando lo activas. Envía un fragmento de audio a ACRCloud por HTTPS y elimina el archivo temporal al terminar.",
+                color = Muted, fontSize = 12.sp, lineHeight = 19.sp
+            )
+            Spacer(Modifier.height(13.dp))
+            HorizontalDivider(color = Color.White.copy(alpha = .10f))
+            Spacer(Modifier.height(13.dp))
+            Text(
+                "Esta versión académica guarda las credenciales localmente sin cifrado. Para publicar la app, protege el Access Secret en un servidor propio.",
+                color = Muted, fontSize = 11.sp, lineHeight = 17.sp
+            )
+        }
+        Spacer(Modifier.height(20.dp))
+        Text("VIBRA 1.2  ·  DISEÑO NEON", color = Muted.copy(alpha=.58f),
+            fontSize = 10.sp, letterSpacing = 1.sp,
+            modifier = Modifier.fillMaxWidth(), textAlign = TextAlign.Center)
+        Spacer(Modifier.height(28.dp))
+    }
+}
+
+
+========================================================================================
+app/src/main/java/com/vibra/app/wearlink/PhoneWatchListenerService.kt
+========================================================================================
+
+package com.vibra.app.wearlink
+
+import com.google.android.gms.wearable.MessageEvent
+import com.google.android.gms.wearable.WearableListenerService
+import org.json.JSONObject
+
+/** Recibe una solicitud únicamente desde la aplicación vinculada por Data Layer. */
+class PhoneWatchListenerService : WearableListenerService() {
+    override fun onMessageReceived(event: MessageEvent) {
+        if (event.path != WatchLink.REQUEST_PATH || event.data.size > 1024) return
+        val id = runCatching {
+            JSONObject(String(event.data, Charsets.UTF_8)).optString("id")
+        }.getOrDefault("")
+        if (!Regex("^[a-zA-Z0-9-]{8,64}$").matches(id)) return
+        WatchLink.savePending(this, id)
+        WatchLink.publish(this, id, "waiting", detail = "Abre la solicitud en tu celular")
+        WatchLink.showRequestNotification(this, id)
+    }
+}
+
+
+========================================================================================
+app/src/main/java/com/vibra/app/wearlink/WatchLink.kt
+========================================================================================
+
+package com.vibra.app.wearlink
+
+import android.Manifest
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.content.Context
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.os.Build
+import androidx.core.app.NotificationCompat
+import androidx.core.content.ContextCompat
+import com.google.android.gms.wearable.PutDataMapRequest
+import com.google.android.gms.wearable.Wearable
+import com.vibra.app.MainActivity
+import com.vibra.app.R
+
+/**
+ * Comunicación reloj-celular. Solo se envían estados y metadatos musicales;
+ * nunca audio, credenciales de ACRCloud ni identificadores personales.
+ */
+object WatchLink {
+    const val REQUEST_PATH = "/vibra/request"
+    const val STATE_PATH = "/vibra/state"
+    const val EXTRA_REQUEST_ID = "vibra.request.id"
+    private const val PREFS = "vibra_wear_messages"
+    private const val PENDING = "pending_request_id"
+    private const val CHANNEL = "vibra_wear_requests"
+
+    fun savePending(context: Context, id: String) {
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .edit().putString(PENDING, id).apply()
+    }
+
+    fun takePending(context: Context): String? {
+        val p = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val id = p.getString(PENDING, null)
+        if (id != null) p.edit().remove(PENDING).apply()
+        return id
+    }
+
+    fun publish(
+        context: Context, id: String, stage: String,
+        title: String = "", artist: String = "", detail: String = ""
+    ) {
+        val data = PutDataMapRequest.create(STATE_PATH).apply {
+            dataMap.putString("id", id)
+            dataMap.putString("stage", stage)
+            dataMap.putString("title", title.take(140))
+            dataMap.putString("artist", artist.take(140))
+            dataMap.putString("detail", detail.take(180))
+            dataMap.putLong("updatedAt", System.currentTimeMillis())
+        }.asPutDataRequest().setUrgent()
+        Wearable.getDataClient(context.applicationContext).putDataItem(data)
+    }
+
+    /** No se intenta grabar audio desde un servicio en segundo plano. */
+    fun showRequestNotification(context: Context, id: String) {
+        val manager = context.getSystemService(NotificationManager::class.java)
+        manager.createNotificationChannel(
+            NotificationChannel(CHANNEL, "Solicitudes desde reloj", NotificationManager.IMPORTANCE_HIGH)
+        )
+        val open = Intent(context, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+            putExtra(EXTRA_REQUEST_ID, id)
+        }
+        val pending = PendingIntent.getActivity(
+            context, 19, open, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        val allowed = Build.VERSION.SDK_INT < 33 ||
+            ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
+        if (!allowed) return
+        manager.notify(2019, NotificationCompat.Builder(context, CHANNEL)
+            .setSmallIcon(R.mipmap.ic_launcher)
+            .setContentTitle("Vibra Watch quiere reconocer música")
+            .setContentText("Toca para abrir Vibra y activar el micrófono del celular")
+            .setContentIntent(pending)
+            .setAutoCancel(true)
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .build())
+    }
+}
+
+
+========================================================================================
+app/src/main/res/values/strings.xml
+========================================================================================
+
+<resources>
+    <string name="app_name">Vibra</string>
+</resources>
+
+
+========================================================================================
+app/src/main/res/values/styles.xml
+========================================================================================
+
+<resources>
+    <style name="Theme.Vibra" parent="android:style/Theme.Material.NoActionBar">
+        <item name="android:fontFamily">sans</item>
+        <item name="android:statusBarColor">#050718</item>
+        <item name="android:navigationBarColor">#050718</item>
+        <item name="android:windowLightStatusBar">false</item>
+    </style>
+</resources>
+
+
+========================================================================================
+build.gradle.kts
+========================================================================================
+
+plugins {
+    id("com.android.application") version "8.13.2" apply false
+    id("org.jetbrains.kotlin.android") version "2.3.10" apply false
+    id("org.jetbrains.kotlin.plugin.compose") version "2.3.10" apply false
+}
+
+
+========================================================================================
+gradle.properties
+========================================================================================
+
+org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+android.useAndroidX=true
+kotlin.code.style=official
+org.gradle.parallel=true
+
+
+========================================================================================
+settings.gradle.kts
+========================================================================================
+
+pluginManagement {
+    repositories {
+        google()
+        mavenCentral()
+        gradlePluginPortal()
+    }
+}
+dependencyResolutionManagement {
+    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+rootProject.name = "Vibra"
+include(":app", ":wear")
+
+
+========================================================================================
+wear/build.gradle.kts
+========================================================================================
+
+plugins {
+    id("com.android.application")
+    id("org.jetbrains.kotlin.android")
+    id("org.jetbrains.kotlin.plugin.compose")
+}
+
+android {
+    namespace = "com.vibra.wear"
+    compileSdk = 36
+    defaultConfig {
+        // Debe coincidir con el módulo app para que funcione Data Layer.
+        applicationId = "com.vibra.app"
+        minSdk = 30
+        targetSdk = 35
+        versionCode = 6
+        versionName = "1.3.0-wear"
+    }
+    buildTypes { release { isMinifyEnabled = false } }
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+    buildFeatures { compose = true }
+}
+kotlin {
+    compilerOptions { jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17) }
+}
+
+dependencies {
+    val composeBom = platform("androidx.compose:compose-bom:2026.06.01")
+    implementation(composeBom)
+    implementation("androidx.activity:activity-compose:1.13.0")
+    implementation("androidx.compose.ui:ui")
+    implementation("androidx.compose.foundation:foundation")
+    implementation("androidx.compose.animation:animation")
+    implementation("com.google.android.gms:play-services-wearable:20.0.1")
+    debugImplementation("androidx.compose.ui:ui-tooling")
+}
+
+
+========================================================================================
+wear/src/main/AndroidManifest.xml
+========================================================================================
+
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-feature android:name="android.hardware.type.watch" android:required="true" />
+    <application
+        android:label="Vibra Watch"
+        android:icon="@mipmap/ic_launcher"
+        android:allowBackup="false"
+        android:theme="@android:style/Theme.Material.NoActionBar">
+        <meta-data android:name="com.google.android.wearable.standalone" android:value="false" />
+        <activity android:name=".MainActivity" android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>
+
+
+========================================================================================
+wear/src/main/java/com/vibra/wear/MainActivity.kt
+========================================================================================
+
+package com.vibra.wear
+
+import android.os.Bundle
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.compose.foundation.text.BasicText
+import com.google.android.gms.wearable.DataEventBuffer
+import com.google.android.gms.wearable.DataMapItem
+import com.google.android.gms.wearable.DataClient
+import com.google.android.gms.wearable.Wearable
+import org.json.JSONObject
+import java.util.UUID
+
+private const val REQUEST = "/vibra/request"
+private const val STATE = "/vibra/state"
+private val Cyan = Color(0xFF26D9FF)
+private val Violet = Color(0xFF9E52FF)
+private val Ice = Color(0xFFF7F9FF)
+private val Muted = Color(0xFFADB9DC)
+
+private data class WatchState(
+    val connected: Boolean = false,
+    val stage: String = "idle",
+    val title: String = "",
+    val artist: String = "",
+    val detail: String = "Toca para reconocer música",
+    val requestId: String = ""
+)
+
+class MainActivity : ComponentActivity(), DataClient.OnDataChangedListener {
+    private var state by mutableStateOf(WatchState())
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContent { WatchScreen(state = state, onRecognize = ::recognize) }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        Wearable.getDataClient(this).addListener(this)
+        Wearable.getNodeClient(this).connectedNodes
+            .addOnSuccessListener { nodes ->
+                state = state.copy(connected = nodes.isNotEmpty())
+            }
+            .addOnFailureListener {
+                state = state.copy(connected = false, detail = "Google Play Services no disponible")
+            }
+        Wearable.getDataClient(this).dataItems.addOnSuccessListener { buffer ->
+            try {
+                for (item in buffer) if (item.uri.path == STATE) readUpdate(item)
+            } finally { buffer.release() }
+        }
+    }
+
+    override fun onPause() {
+        Wearable.getDataClient(this).removeListener(this)
+        super.onPause()
+    }
+
+    override fun onDataChanged(events: DataEventBuffer) {
+        try {
+            for (event in events) {
+                if (event.type == com.google.android.gms.wearable.DataEvent.TYPE_CHANGED &&
+                    event.dataItem.uri.path == STATE
+                ) readUpdate(event.dataItem)
+            }
+        } finally { events.release() }
+    }
+
+    private fun readUpdate(item: com.google.android.gms.wearable.DataItem) {
+        val data = DataMapItem.fromDataItem(item).dataMap
+        val id = data.getString("id").orEmpty()
+        // Si hay una solicitud en curso, ignorar respuestas atrasadas de otra solicitud.
+        if (state.requestId.isNotBlank() && state.requestId != id) return
+        state = state.copy(
+            stage = data.getString("stage").orEmpty(),
+            title = data.getString("title").orEmpty(),
+            artist = data.getString("artist").orEmpty(),
+            detail = data.getString("detail").orEmpty(),
+            requestId = id
+        )
+    }
+
+    private fun recognize() {
+        if (state.stage in listOf("requesting", "waiting", "recording", "identifying")) return
+        state = state.copy(stage = "requesting", detail = "Buscando teléfono...")
+        Wearable.getNodeClient(this).connectedNodes.addOnSuccessListener { nodes ->
+            val phone = nodes.firstOrNull { it.isNearby } ?: nodes.firstOrNull()
+            if (phone == null) {
+                state = state.copy(connected = false, stage = "error", detail = "Vincula un celular Android")
+                return@addOnSuccessListener
+            }
+            val id = UUID.randomUUID().toString()
+            state = state.copy(connected = true, requestId = id, stage = "requesting", title = "", artist = "", detail = "Enviando solicitud...")
+            val payload = JSONObject().put("id", id).toString().toByteArray(Charsets.UTF_8)
+            Wearable.getMessageClient(this).sendMessage(phone.id, REQUEST, payload)
+                .addOnSuccessListener {
+                    state = state.copy(stage = "waiting", detail = "Abre la notificación en el celular")
+                }
+                .addOnFailureListener {
+                    state = state.copy(stage = "error", detail = "No se pudo contactar al celular")
+                }
+        }.addOnFailureListener {
+            state = state.copy(connected = false, stage = "error", detail = "Sin conexión con el celular")
+        }
+    }
+}
+
+@Composable
+private fun WatchScreen(state: WatchState, onRecognize: () -> Unit) {
+    val listening = state.stage == "recording" || state.stage == "identifying"
+    val transition = rememberInfiniteTransition(label = "pulse")
+    val pulse by transition.animateFloat(
+        initialValue = 0.82f, targetValue = 1.0f,
+        animationSpec = infiniteRepeatable(tween(1300), RepeatMode.Reverse), label = "pulseFloat"
+    )
+    Box(
+        Modifier.fillMaxSize().background(
+            Brush.radialGradient(listOf(Color(0xFF10276A), Color(0xFF080D2B), Color(0xFF040715)))
+        ), contentAlignment = Alignment.Center
+    ) {
+        Canvas(Modifier.fillMaxSize()) {
+            drawCircle(color = Cyan.copy(alpha = if (listening) .23f * pulse else .07f),
+                radius = size.minDimension * .39f * pulse, center = center,
+                style = Stroke(width = 3.dp.toPx()))
+            drawCircle(color = Violet.copy(alpha = if (listening) .22f else .08f),
+                radius = size.minDimension * .46f, center = center,
+                style = Stroke(width = 1.3.dp.toPx()))
+        }
+        Column(
+            modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState())
+                .padding(horizontal = 29.dp, vertical = 15.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center
+        ) {
+            Word("vibra", 19, Ice, FontWeight.Bold)
+            Spacer(Modifier.height(3.dp))
+            Word(if (state.connected) "● Celular conectado" else "○ Sin conexión", 10,
+                if (state.connected) Cyan else Muted)
+            Spacer(Modifier.height(8.dp))
+            Box(Modifier.size(82.dp).clip(CircleShape)
+                .background(Brush.linearGradient(listOf(Cyan, Color(0xFF136CFB), Violet)))
+                .clickable(onClick = onRecognize), contentAlignment = Alignment.Center) {
+                Image(painterResource(R.drawable.vibra_mark), "Reconocer canción",
+                    Modifier.size(72.dp))
+            }
+            Spacer(Modifier.height(8.dp))
+            val headline = when (state.stage) {
+                "requesting" -> "Conectando..."
+                "waiting" -> "En tu celular"
+                "recording" -> "Escuchando..."
+                "identifying" -> "Identificando..."
+                "found" -> "¡La encontré!"
+                "no_match" -> "Sin coincidencia"
+                "error" -> "Revisa conexión"
+                else -> "Reconocer música"
+            }
+            Word(headline, 14, Ice, FontWeight.Bold)
+            if (state.stage == "found" && state.title.isNotBlank()) {
+                Spacer(Modifier.height(3.dp))
+                Word(state.title, 12, Cyan, FontWeight.SemiBold)
+                Word(state.artist, 10, Muted)
+            } else {
+                Spacer(Modifier.height(4.dp))
+                Word(state.detail, 10, Muted)
+            }
+            if (state.stage == "found" || state.stage == "error" || state.stage == "no_match") {
+                Spacer(Modifier.height(5.dp))
+                Word("Toca el icono para buscar otra", 9, Muted)
+            }
+        }
+    }
+}
+
+@Composable
+private fun Word(text: String, size: Int, color: Color, weight: FontWeight = FontWeight.Normal) {
+    BasicText(text, modifier = Modifier.fillMaxWidth(), maxLines = 2, overflow = TextOverflow.Ellipsis,
+        style = TextStyle(color = color, fontSize = size.sp, fontWeight = weight,
+            textAlign = TextAlign.Center, lineHeight = (size + 3).sp))
+}
+
